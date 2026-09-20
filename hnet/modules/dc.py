@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,11 @@ class RoutingModuleOutput:
     boundary_prob: torch.Tensor
     boundary_mask: torch.Tensor
     selected_probs: torch.Tensor
+    router_module: Optional[nn.Module] = None
+    stage_idx: int = 0
+    backbone_idx: int = 0
+    n_backbones: int = 1
+    mask: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -46,8 +52,21 @@ class DeChunkState:
 
 class RoutingModule(nn.Module):
 
-    def __init__(self, d_model, device=None, dtype=None):
+    def __init__(
+        self,
+        d_model,
+        stage_idx: int = 0,
+        backbone_idx: int = 0,
+        n_backbones: int = 1,
+        target_N: float = 2.0,
+        device=None,
+        dtype=None,
+    ):
         self.d_model = d_model
+        self.stage_idx = stage_idx
+        self.backbone_idx = backbone_idx
+        self.n_backbones = n_backbones
+        self.target_N = target_N
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
@@ -57,6 +76,20 @@ class RoutingModule(nn.Module):
             self.k_proj_layer.weight.copy_(torch.eye(d_model))
         self.q_proj_layer.weight._no_reinit = True
         self.k_proj_layer.weight._no_reinit = True
+
+        # Non-gradient bias buffer for auxiliary-loss-free load balancing (DeepSeek-style)
+        self.register_buffer("bias", torch.zeros(1, **factory_kwargs))
+
+    def set_bias(self, bias_value: Union[float, torch.Tensor]) -> None:
+        with torch.no_grad():
+            if isinstance(bias_value, torch.Tensor):
+                self.bias.copy_(bias_value.to(device=self.bias.device, dtype=self.bias.dtype))
+            else:
+                self.bias.fill_(float(bias_value))
+
+    def reset_bias(self) -> None:
+        with torch.no_grad():
+            self.bias.zero_()
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return RoutingModuleState(
@@ -88,8 +121,9 @@ class RoutingModule(nn.Module):
             F.normalize(self.q_proj_layer(hidden_states[:, :-1]), dim=-1),
             F.normalize(self.k_proj_layer(hidden_states[:, 1:]), dim=-1),
         )
-        # this clamp should no-op as long as no precision issues are encountered
-        boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
+        # Nudge probability with bias (transparently with no gradients)
+        raw_boundary_prob = (1 - cos_sim) / 2
+        boundary_prob = torch.clamp(raw_boundary_prob + self.bias, min=0.0, max=1.0)
 
         # Force boundary probability of the first element to 1.0
         PAD_PROB = 1.0
@@ -135,6 +169,11 @@ class RoutingModule(nn.Module):
             boundary_prob=boundary_prob,  # (shape hidden_states.shape[:-1], 2)
             boundary_mask=boundary_mask,  # (shape hidden_states.shape[:-1])
             selected_probs=selected_probs,  # (shape hidden_states.shape[:-1], 1)
+            router_module=self,
+            stage_idx=self.stage_idx,
+            backbone_idx=self.backbone_idx,
+            n_backbones=self.n_backbones,
+            mask=mask,
         )
 
     def step(self, hidden_states, inference_params):
@@ -145,7 +184,8 @@ class RoutingModule(nn.Module):
             F.normalize(self.q_proj_layer(inference_params.last_hidden_state), dim=-1),
             F.normalize(self.k_proj_layer(hidden_states), dim=-1),
         )
-        boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
+        raw_boundary_prob = (1 - cos_sim) / 2
+        boundary_prob = torch.clamp(raw_boundary_prob + self.bias, min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
         boundary_prob = torch.where(
             inference_params.has_seen_tokens,
@@ -161,6 +201,10 @@ class RoutingModule(nn.Module):
             boundary_prob=boundary_prob,  # (B, 2)
             boundary_mask=boundary_prob[..., 1] > 0.5,  # (B,)
             selected_probs=boundary_prob.max(dim=-1).values.unsqueeze(-1),  # (B, 1)
+            router_module=self,
+            stage_idx=self.stage_idx,
+            backbone_idx=self.backbone_idx,
+            n_backbones=self.n_backbones,
         )
 
 
@@ -253,6 +297,12 @@ class DeChunkLayer(nn.Module):
                 :, 0
             ].all(), "First token must be a boundary if running prefill"
 
+        if not boundary_mask.any():
+            if cu_seqlens is not None:
+                return torch.zeros((boundary_mask.shape[0], self.d_model), device=boundary_prob.device, dtype=hidden_states.dtype)
+            else:
+                return torch.zeros((boundary_mask.shape[0], boundary_mask.shape[1], self.d_model), device=boundary_prob.device, dtype=hidden_states.dtype)
+
         p = torch.clamp(boundary_prob[..., -1].float(), min=1e-4, max=1 - (1e-4))
 
         if cu_seqlens is not None:
@@ -317,20 +367,22 @@ class DeChunkLayer(nn.Module):
         # boundary_mask is (B,) and boundary_prob is (B, 2)
 
         B = boundary_mask.shape[0]
-        # B_selected = hidden_states.shape[0]
-        D = hidden_states.shape[-1]
+        D = self.d_model
 
-        p = torch.zeros(B, device=hidden_states.device, dtype=hidden_states.dtype)
-        p[boundary_mask] = boundary_prob[boundary_mask, -1].clamp(
-            min=1e-4, max=1 - (1e-4)
-        )
+        p = torch.zeros(B, device=boundary_prob.device, dtype=boundary_prob.dtype)
+        if boundary_mask.any():
+            p[boundary_mask] = boundary_prob[boundary_mask, -1].clamp(
+                min=1e-4, max=1.0 - 1e-4
+            )
 
         current_hidden_states = torch.zeros(
             B, D, device=hidden_states.device, dtype=hidden_states.dtype
         )
-        current_hidden_states[boundary_mask] = hidden_states.squeeze(1)
+        if boundary_mask.any() and hidden_states.shape[0] > 0:
+            current_hidden_states[boundary_mask] = hidden_states.squeeze(1)
 
-        result = p * current_hidden_states + (1 - p) * inference_params.last_value
+        p_expanded = p.unsqueeze(-1).to(dtype=inference_params.last_value.dtype)
+        result = p_expanded * current_hidden_states + (1.0 - p_expanded) * inference_params.last_value
         inference_params.last_value.copy_(result)
 
         return result.unsqueeze(1)

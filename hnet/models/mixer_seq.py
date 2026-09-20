@@ -1,5 +1,6 @@
-from collections import namedtuple
+import re
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -9,22 +10,27 @@ from flash_attn.utils.generation import GenerationMixin
 from .hnet import HNet, HNetState
 from .config_hnet import HNetConfig
 
-from hnet.modules.dc import RoutingModuleOutput
+from hnet.modules.dc import RoutingModule, RoutingModuleOutput
 from hnet.modules.utils import apply_optimization_params
 
 @dataclass
 class CausalLMOutput:
     logits: torch.Tensor
     bpred_output: list[RoutingModuleOutput]
-    inference_params: HNetState
+    inference_params: Optional[HNetState] = None
 
 
 class HNetForCausalLM(nn.Module, GenerationMixin):
     def __init__(
         self,
         config: HNetConfig,
+        layout=None,
+        routing_layer=None,
+        num_backbones=None,
+        join_mode=None,
         device=None,
         dtype=None,
+        **kwargs,
     ) -> None:
         self.config = config
 
@@ -43,10 +49,30 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
             # We pass in the stage_idx as an HNet needs to know what
             # depth of the hierarchy it is in.
             stage_idx=0,
+            layout=layout,
+            routing_layer=routing_layer,
+            num_backbones=num_backbones,
+            join_mode=join_mode,
+            **kwargs,
             **factory_kwargs,
         )
         self.lm_head = nn.Linear(d_embed, vocab_size, bias=False, **factory_kwargs)
         self.tie_weights()
+
+    def load_state_dict(self, state_dict: Dict[str, Any], strict: bool = True, assign: bool = False):
+        """
+        Loads state_dict with seamless backwards compatibility for single-backbone checkpoints.
+        """
+        remapped_state_dict = {}
+        for k, v in state_dict.items():
+            new_k = k
+            new_k = re.sub(r"\.main_network\.", ".main_networks.0.", new_k)
+            new_k = re.sub(r"\.routing_module\.", ".routing_modules.0.", new_k)
+            new_k = re.sub(r"\.chunk_layer\.", ".chunk_layers.0.", new_k)
+            new_k = re.sub(r"\.dechunk_layer\.", ".dechunk_layers.0.", new_k)
+            new_k = re.sub(r"\.routing_layer\.", ".routing_layers.0.", new_k)
+            remapped_state_dict[new_k] = v
+        return super().load_state_dict(remapped_state_dict, strict=strict, assign=assign)
 
     def tie_weights(self):
         if self.config.tie_embeddings:
@@ -74,6 +100,12 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
         for param in self.lm_head.parameters():
             apply_optimization_params(param, lr_multiplier=lr_multiplier[0])
         self.backbone._apply_lr_multiplier(lr_multiplier)
+
+    def get_router_modules(self) -> List[RoutingModule]:
+        """
+        Returns a list of all RoutingModule instances across the model hierarchy.
+        """
+        return [m for m in self.modules() if isinstance(m, RoutingModule)]
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(
@@ -127,9 +159,6 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
             hidden_states = hidden_states[:, -num_last_tokens:]
         lm_logits = self.lm_head(hidden_states)
 
-        CausalLMOutput = namedtuple(
-            "CausalLMOutput", ["logits", "bpred_output", "inference_params"]
-        )
         return CausalLMOutput(
             logits=lm_logits,
             bpred_output=bpred_output,
@@ -152,3 +181,4 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
         return CausalLMOutput(
             logits=logits, bpred_output=bpred_output, inference_params=inference_params
         )
+

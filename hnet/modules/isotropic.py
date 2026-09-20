@@ -48,6 +48,7 @@ class Isotropic(nn.Module):
         config: HNetConfig,
         pos_idx: int,
         stage_idx: int,
+        layout: Optional[str] = None,
         device=None,
         dtype=None,
     ):
@@ -55,14 +56,18 @@ class Isotropic(nn.Module):
         super().__init__()
 
         self.stage_idx = stage_idx
-        self.d_model = config.d_model[self.stage_idx]
+        d_model_idx = min(stage_idx, len(config.d_model) - 1)
+        self.d_model = config.d_model[d_model_idx]
         self.ssm_cfg = get_stage_cfg(config.ssm_cfg, stage_idx)
         self.attn_cfg = get_stage_cfg(config.attn_cfg, stage_idx)
 
-        arch_layout = config.arch_layout
-        for _ in range(stage_idx):
-            arch_layout = arch_layout[1]
-        arch_layout = arch_layout[pos_idx]
+        if layout is not None:
+            arch_layout = layout
+        else:
+            arch_layout = config.arch_layout
+            for _ in range(stage_idx):
+                arch_layout = arch_layout[1]
+            arch_layout = arch_layout[pos_idx]
         layout_parse = re.findall(r"([mMtT])(\d+)", arch_layout)
 
         layers = []
@@ -74,11 +79,16 @@ class Isotropic(nn.Module):
         for arch, n_layer in layout_parse:
             assert arch in ("m", "M", "t", "T")
             assert n_layer.isdigit()
+            d_intermediate_val = (
+                config.d_intermediate[min(self.stage_idx, len(config.d_intermediate) - 1)]
+                if len(config.d_intermediate) > 0
+                else 0
+            )
             layers += [
                 create_block(
                     arch,
                     self.d_model,
-                    d_intermediate=config.d_intermediate[self.stage_idx],
+                    d_intermediate=d_intermediate_val,
                     ssm_cfg=self.ssm_cfg,
                     attn_cfg=self.attn_cfg,
                     layer_idx=(layer_idx + i),
